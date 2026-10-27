@@ -1,0 +1,1227 @@
+#!/bin/bash
+# macuninstall: conservative macOS app uninstaller + orphan auditor
+# Compatible with macOS system Bash 3.2.
+# Default mode is audit-only.
+
+set +u  # macOS Bash 3.2: empty arrays + nounset are problematic
+IFS=$'\n\t'
+
+VER='0.4.2'
+
+UIDN="$(id -u)"
+GIDN="$(id -g)"
+
+STATE="$HOME/.local/state/macuninstall"
+SNAP="$STATE/apps.tsv"
+
+TMP="${TMPDIR:-/tmp}/macuninstall.$$"
+
+STAMP="$(date +%Y%m%d-%H%M%S)"
+TRASH="$HOME/.Trash/MacUninstall-$STAMP"
+
+mkdir -p "$STATE" "$TMP"
+
+trap 'rm -rf "$TMP"' EXIT INT TERM
+
+SAFE=()
+REVIEW=()
+BTM=()
+STALE_CASKS=()
+
+TARGET=()
+TARGET_PLISTS=()
+
+say()
+{
+    printf '%s\n' "$*"
+}
+
+add()
+{
+    local arr="$1"
+    local value="$2"
+    local x
+
+    eval 'for x in "${'"$arr"'[@]}"; do
+        [ "$x" = "$value" ] && return
+    done'
+
+    eval "$arr+=(\"\$value\")"
+}
+
+plist()
+{
+    /usr/libexec/PlistBuddy \
+        -c "Print :$2" \
+        "$1" 2>/dev/null |
+        head -n 1
+}
+
+label()
+{
+    local value
+
+    value="$(plist "$1" Label)"
+
+    if [ -n "$value" ]; then
+        printf '%s' "$value"
+    else
+        basename "$1" .plist
+    fi
+}
+
+program()
+{
+    local value
+
+    value="$(plist "$1" Program)"
+
+    [ -n "$value" ] ||
+        value="$(plist "$1" 'ProgramArguments:0')"
+
+    printf '%s' "$value"
+}
+
+usage()
+{
+cat <<EOF
+macuninstall $VER
+
+Usage:
+
+  macuninstall
+      Full orphan/junk audit.
+
+  macuninstall --audit
+      Same as above.
+
+  macuninstall --brew
+      Homebrew audit and cleanup only.
+
+  macuninstall "/Applications/Foo.app"
+      Targeted clean uninstall.
+
+  macuninstall --snapshot
+      Refresh installed-app baseline only.
+
+  macuninstall --help
+
+Safety:
+
+  * scans first
+  * nothing deleted automatically
+  * SAFE files go to ~/.Trash/MacUninstall-<timestamp>
+  * fuzzy matches are report-only
+  * BTM is NEVER reset automatically
+
+EOF
+}
+
+# ============================================================
+# INSTALLED APPLICATION SNAPSHOT
+# ============================================================
+
+scan_apps()
+{
+    : > "$TMP/apps.tsv"
+
+    local root
+    local app
+    local bid
+    local name
+
+    for root in \
+        /Applications \
+        "$HOME/Applications"
+    do
+        [ -d "$root" ] || continue
+
+        while IFS= read -r app
+        do
+            bid="$(
+                plist \
+                    "$app/Contents/Info.plist" \
+                    CFBundleIdentifier
+            )"
+
+            [ -n "$bid" ] || continue
+
+            name="$(
+                plist \
+                    "$app/Contents/Info.plist" \
+                    CFBundleDisplayName
+            )"
+
+            [ -n "$name" ] ||
+                name="$(
+                    plist \
+                        "$app/Contents/Info.plist" \
+                        CFBundleName
+                )"
+
+            [ -n "$name" ] ||
+                name="$(basename "$app" .app)"
+
+            printf '%s\t%s\t%s\n' \
+                "$bid" \
+                "$name" \
+                "$app" \
+                >> "$TMP/apps.tsv"
+
+        done < <(
+            find "$root" \
+                -maxdepth 3 \
+                -type d \
+                -name '*.app' \
+                -print \
+                2>/dev/null
+        )
+    done
+
+    sort -u \
+        "$TMP/apps.tsv" \
+        -o "$TMP/apps.tsv"
+}
+
+exact_residues()
+{
+    local bid="$1"
+    local name="$2"
+    local p
+
+    for p in \
+        "$HOME/Library/Preferences/$bid.plist" \
+        "$HOME/Library/Caches/$bid" \
+        "$HOME/Library/Saved Application State/$bid.savedState" \
+        "$HOME/Library/HTTPStorages/$bid" \
+        "$HOME/Library/WebKit/$bid" \
+        "$HOME/Library/Containers/$bid" \
+        "$HOME/Library/Application Support/$name" \
+        "/Library/Application Support/$name"
+    do
+        [ -e "$p" ] || [ -L "$p" ] || continue
+
+        add REVIEW \
+            "exact residue [$name | $bid]: $p"
+    done
+
+    for p in \
+        "$HOME/Library/Preferences/$bid".* \
+        "$HOME/Library/Caches/$bid".* \
+        "$HOME/Library/HTTPStorages/$bid".*
+    do
+        [ -e "$p" ] || [ -L "$p" ] || continue
+
+        add REVIEW \
+            "exact-prefix residue [$name | $bid]: $p"
+    done
+}
+
+compare_snapshot()
+{
+    if [ ! -f "$SNAP" ]; then
+        say \
+            'Snapshot: first run; baseline will be created.'
+
+        return
+    fi
+
+    local bid
+    local name
+    local oldpath
+
+    while IFS=$'\t' read -r \
+        bid \
+        name \
+        oldpath
+    do
+        [ -n "$bid" ] || continue
+
+        if grep \
+            -Fq \
+            "$bid"$'\t' \
+            "$TMP/apps.tsv"
+        then
+            continue
+        fi
+
+        add REVIEW \
+            "app disappeared since previous snapshot: $name | $bid | $oldpath"
+
+        exact_residues \
+            "$bid" \
+            "$name"
+
+    done < "$SNAP"
+}
+
+save_snapshot()
+{
+    cp \
+        "$TMP/apps.tsv" \
+        "$SNAP"
+}
+
+# ============================================================
+# LAUNCHD
+# ============================================================
+
+scan_launchd()
+{
+    say \
+        '== launchd orphan scan =='
+
+    local dir
+    local p
+    local exe
+    local id
+    local owner
+
+    for dir in \
+        "$HOME/Library/LaunchAgents" \
+        /Library/LaunchAgents \
+        /Library/LaunchDaemons
+    do
+        [ -d "$dir" ] || continue
+
+        for p in "$dir"/*.plist
+        do
+            [ -f "$p" ] || continue
+
+            exe="$(program "$p")"
+            id="$(label "$p")"
+
+            case "$exe" in
+                /*)
+                    if [ ! -e "$exe" ]; then
+                        add SAFE "$p"
+
+                        add REVIEW \
+                            "missing executable [$id]: $exe"
+
+                        case "$exe" in
+                            *'.app/'*)
+                                owner="$(
+                                    basename \
+                                        "${exe%%.app/*}.app" \
+                                        .app
+                                )"
+
+                                [ -n "$owner" ] &&
+                                    add REVIEW \
+                                        "possible owner: $owner"
+                            ;;
+                        esac
+                    fi
+                ;;
+            esac
+        done
+    done
+}
+
+# ============================================================
+# BACKGROUND TASK MANAGEMENT
+# ============================================================
+
+btm_dump()
+{
+    if /usr/bin/sfltool \
+        dumpbtm \
+        > "$TMP/btm.txt" \
+        2>/dev/null
+    then
+        return 0
+    fi
+
+    say \
+        'BTM: sudo required for dumpbtm.'
+
+    sudo /usr/bin/sfltool \
+        dumpbtm \
+        > "$TMP/btm.txt"
+}
+
+normalize_btm_path()
+{
+    local p="$1"
+
+    case "$p" in
+        "/Users/$UIDN/"*)
+            printf '%s/%s' \
+                "$HOME" \
+                "${p#/Users/$UIDN/}"
+        ;;
+        *)
+            printf '%s' "$p"
+        ;;
+    esac
+}
+
+scan_btm()
+{
+    say \
+        '== Background Task Management scan =='
+
+    btm_dump ||
+    {
+        say \
+            'BTM scan failed.'
+
+        return
+    }
+
+    awk '
+        function flush_record() {
+            if (n != "" || i != "")
+                print n "\t" i "\t" u "\t" e
+
+            n=""
+            i=""
+            u=""
+            e=""
+        }
+
+        /^[[:space:]]*Name:/ {
+            n=$0
+            sub(/^[^:]*:[[:space:]]*/, "", n)
+            next
+        }
+
+        /^[[:space:]]*Identifier:/ {
+            i=$0
+            sub(/^[^:]*:[[:space:]]*/, "", i)
+            next
+        }
+
+        /^[[:space:]]*URL:/ {
+            u=$0
+            sub(/^[^:]*:[[:space:]]*/, "", u)
+            next
+        }
+
+        /^[[:space:]]*Executable Path:/ {
+            e=$0
+            sub(/^[^:]*:[[:space:]]*/, "", e)
+            next
+        }
+
+        /^[[:space:]]*$/ {
+            flush_record()
+            next
+        }
+
+        END {
+            flush_record()
+        }
+    ' "$TMP/btm.txt" > "$TMP/btm.tsv"
+
+    local n
+    local i
+    local u
+    local e
+    local u_check
+    local e_check
+
+    while IFS=$'\t' read -r n i u e
+    do
+        u_check="$u"
+        e_check="$e"
+
+        if [ -n "$u_check" ] && [ "$u_check" != '(null)' ]; then
+            u_check="$(normalize_btm_path "$u_check")"
+        fi
+
+        if [ -n "$e_check" ]; then
+            e_check="$(normalize_btm_path "$e_check")"
+        fi
+
+        if \
+            [ -n "$e_check" ] &&
+            [ "${e_check#/}" != "$e_check" ] &&
+            [ ! -e "$e_check" ]
+        then
+            add BTM \
+                "stale [$n | $i] missing executable: $e_check"
+
+        elif \
+            [ -n "$u_check" ] &&
+            [ "$u_check" != '(null)' ] &&
+            [ "${u_check#/}" != "$u_check" ] &&
+            [ ! -e "$u_check" ]
+        then
+            add BTM \
+                "stale [$n | $i] missing URL: $u_check"
+        fi
+
+    done < "$TMP/btm.tsv"
+}
+
+# ============================================================
+# HOMEBREW
+# ============================================================
+
+brewbin()
+{
+    if command \
+        -v brew \
+        >/dev/null 2>&1
+    then
+        command -v brew
+        return
+    fi
+
+    if [ -x /opt/homebrew/bin/brew ]; then
+        printf /opt/homebrew/bin/brew
+        return
+    fi
+
+    if [ -x /usr/local/bin/brew ]; then
+        printf /usr/local/bin/brew
+        return
+    fi
+
+    return 1
+}
+
+scan_brew()
+{
+    local brew
+    local cask
+    local line
+    local app
+    local base
+    local any=0
+
+    brew="$(brewbin)" ||
+    {
+        say \
+            'Homebrew: not installed.'
+        return
+    }
+
+    say \
+        '== Homebrew =='
+
+    say \
+        '-- brew autoremove --dry-run --'
+
+    "$brew" \
+        autoremove \
+        --dry-run \
+        2>&1 |
+        sed 's/^/  /'
+
+    say \
+        '-- brew cleanup --dry-run --'
+
+    "$brew" \
+        cleanup \
+        --dry-run \
+        2>&1 |
+        sed 's/^/  /'
+
+    say \
+        '-- casks registered but .app artifact missing --'
+
+    while IFS= read -r cask
+    do
+        [ -n "$cask" ] || continue
+
+        while IFS= read -r line
+        do
+            app="$(
+                printf \
+                    '%s' \
+                    "$line" |
+                    sed \
+                        -E \
+                        's/^[[:space:]]+//;s/[[:space:]]+\(App\)$//'
+            )"
+
+            case "$app" in
+                *.app)
+                    ;;
+                *)
+                    continue
+                    ;;
+            esac
+
+            base="$(basename "$app")"
+
+            if \
+                [ ! -e "/Applications/$base" ] &&
+                [ ! -e "$HOME/Applications/$base" ]
+            then
+                add \
+                    STALE_CASKS \
+                    "$cask"
+
+                say \
+                    "  $cask -> missing $base"
+
+                any=1
+            fi
+
+        done < <(
+            "$brew" \
+                info \
+                --cask \
+                "$cask" \
+                2>/dev/null |
+                sed \
+                    -n \
+                    '/^==> Artifacts$/,$p' |
+                grep \
+                    -E \
+                    '\.app[[:space:]]+\(App\)$' ||
+            true
+        )
+
+    done < <(
+        "$brew" \
+            list \
+            --cask \
+            2>/dev/null ||
+        true
+    )
+
+    [ "$any" -eq 1 ] ||
+        say \
+            '  none detected'
+}
+
+# ============================================================
+# SAFE CLEANUP
+# ============================================================
+
+unload()
+{
+    case "$1" in
+        */LaunchDaemons/*)
+            sudo launchctl \
+                bootout \
+                system \
+                "$1" \
+                >/dev/null \
+                2>&1 ||
+            true
+        ;;
+        */LaunchAgents/*)
+            launchctl \
+                bootout \
+                "gui/$UIDN" \
+                "$1" \
+                >/dev/null \
+                2>&1 ||
+            true
+        ;;
+    esac
+}
+
+trash()
+{
+    local p="$1"
+    local dest
+
+    [ -e "$p" ] || [ -L "$p" ] ||
+        return
+
+    mkdir -p "$TRASH"
+
+    dest="$TRASH/$(
+        printf \
+            '%s' \
+            "$p" |
+            sed \
+                's#^/##;s#/#__#g'
+    )"
+
+    say \
+        "MOVE: $p"
+
+    if [ -w "$(dirname "$p")" ]; then
+        mv \
+            "$p" \
+            "$dest"
+    else
+        sudo mv \
+            "$p" \
+            "$dest" &&
+
+        sudo chown \
+            -R \
+            "$UIDN:$GIDN" \
+            "$dest" \
+            2>/dev/null ||
+        true
+    fi
+}
+
+clean_safe()
+{
+    if [ "${#SAFE[@]}" -eq 0 ]; then
+        say \
+            'No SAFE orphan files.'
+        return
+    fi
+
+    say \
+        "Destination: $TRASH"
+
+    printf \
+        'Quarantine all SAFE items? [y/N] '
+
+    read -r answer
+
+    case "$answer" in
+        y|Y|yes|YES)
+            local p
+
+            for p in "${SAFE[@]}"
+            do
+                unload "$p"
+                trash "$p"
+            done
+        ;;
+    esac
+}
+
+clean_brew()
+{
+    local brew
+    local cask
+    local answer
+
+    brew="$(brewbin)" ||
+        return
+
+    printf \
+        'Run brew autoremove + brew cleanup? [y/N] '
+
+    read -r answer
+
+    case "$answer" in
+        y|Y|yes|YES)
+            "$brew" autoremove
+            "$brew" cleanup
+        ;;
+    esac
+
+    for cask in "${STALE_CASKS[@]}"
+    do
+        printf \
+            'Zap stale cask %s with --zap --force? [y/N] ' \
+            "$cask"
+
+        read -r answer
+
+        case "$answer" in
+            y|Y|yes|YES)
+                "$brew" \
+                    uninstall \
+                    --cask \
+                    --zap \
+                    --force \
+                    "$cask"
+            ;;
+        esac
+    done
+}
+
+report()
+{
+    local x
+
+    say ''
+    say \
+        '=== SAFE: can be quarantined automatically ==='
+
+    [ "${#SAFE[@]}" -gt 0 ] ||
+        say \
+            '  none'
+
+    for x in "${SAFE[@]}"
+    do
+        say \
+            "  $x"
+    done
+
+    say ''
+    say \
+        '=== REVIEW: evidence found, never auto-delete ==='
+
+    [ "${#REVIEW[@]}" -gt 0 ] ||
+        say \
+            '  none'
+
+    for x in "${REVIEW[@]}"
+    do
+        say \
+            "  $x"
+    done
+
+    say ''
+    say \
+        '=== BTM-ONLY: macOS registry stale, report only ==='
+
+    [ "${#BTM[@]}" -gt 0 ] ||
+        say \
+            '  none'
+
+    for x in "${BTM[@]}"
+    do
+        say \
+            "  $x"
+    done
+
+    if [ "${#STALE_CASKS[@]}" -gt 0 ]; then
+        say ''
+        say \
+            '=== Homebrew stale casks ==='
+
+        for x in "${STALE_CASKS[@]}"
+        do
+            say \
+                "  $x -> brew uninstall --cask --zap --force $x"
+        done
+    fi
+}
+
+menu()
+{
+    say ''
+    say \
+        'Actions:'
+
+    say \
+        '  1  quarantine SAFE orphan files'
+
+    say \
+        '  2  Homebrew cleanup/autoremove + stale-cask offers'
+
+    say \
+        '  3  both 1 and 2'
+
+    say \
+        '  4  print optional global BTM reset command'
+
+    say \
+        '  q  quit'
+
+    printf '> '
+
+    read -r answer
+
+    case "$answer" in
+        1)
+            clean_safe
+        ;;
+        2)
+            clean_brew
+        ;;
+        3)
+            clean_safe
+            clean_brew
+        ;;
+        4)
+            say \
+                'sudo sfltool resetbtm'
+
+            say \
+                'sudo reboot'
+        ;;
+        *)
+            say \
+                'No changes made.'
+        ;;
+    esac
+}
+
+# ============================================================
+# TARGETED UNINSTALL
+# ============================================================
+
+find_cask()
+{
+    local app="$1"
+    local brew
+    local cask
+
+    brew="$(brewbin)" ||
+        return 1
+
+    while IFS= read -r cask
+    do
+        "$brew" \
+            info \
+            --cask \
+            "$cask" \
+            2>/dev/null |
+            sed \
+                -n \
+                '/^==> Artifacts$/,$p' |
+            grep \
+                -Fq \
+                "$app (App)" &&
+
+        {
+            printf \
+                '%s' \
+                "$cask"
+            return
+        }
+
+    done < <(
+        "$brew" \
+            list \
+            --cask \
+            2>/dev/null ||
+        true
+    )
+
+    return 1
+}
+
+add_target()
+{
+    [ -e "$1" ] || [ -L "$1" ] ||
+        return
+
+    add \
+        TARGET \
+        "$1"
+}
+
+target_launchd()
+{
+    local bid="$1"
+    local appbase="$2"
+    local name="$3"
+
+    local dir
+    local p
+    local dump
+    local exe
+
+    for dir in \
+        "$HOME/Library/LaunchAgents" \
+        /Library/LaunchAgents \
+        /Library/LaunchDaemons
+    do
+        [ -d "$dir" ] ||
+            continue
+
+        for p in "$dir"/*.plist
+        do
+            [ -f "$p" ] ||
+                continue
+
+            dump="$(
+                plutil \
+                    -p \
+                    "$p" \
+                    2>/dev/null ||
+                true
+            )"
+
+            if \
+                {
+                    [ -n "$bid" ] &&
+                    printf \
+                        '%s' \
+                        "$dump" |
+                        grep \
+                            -Fqi \
+                            "$bid"
+                } ||
+                printf \
+                    '%s' \
+                    "$dump" |
+                    grep \
+                        -Fqi \
+                        "$appbase" ||
+                printf \
+                    '%s' \
+                    "$dump" |
+                    grep \
+                        -Fqi \
+                        "$name"
+            then
+                add_target "$p"
+
+                add \
+                    TARGET_PLISTS \
+                    "$p"
+
+                exe="$(program "$p")"
+
+                case "$exe" in
+                    /Library/PrivilegedHelperTools/*)
+                        add_target \
+                            "$exe"
+                    ;;
+                esac
+            fi
+        done
+    done
+}
+
+targeted()
+{
+    local app="$1"
+    local info_plist
+    local bid
+    local name
+    local appbase
+    local cask
+    local p
+    local receipts
+    local answer
+
+    [ -d "$app" ] ||
+    {
+        say \
+            "App not found: $app" \
+            >&2
+        exit 2
+    }
+
+    info_plist="$app/Contents/Info.plist"
+
+    [ -f "$info_plist" ] ||
+    {
+        say \
+            'Not a valid .app bundle.' \
+            >&2
+        exit 2
+    }
+
+    bid="$(
+        plist \
+            "$info_plist" \
+            CFBundleIdentifier
+    )"
+
+    name="$(
+        plist \
+            "$info_plist" \
+            CFBundleDisplayName
+    )"
+
+    [ -n "$name" ] ||
+        name="$(
+            plist \
+                "$info_plist" \
+                CFBundleName
+        )"
+
+    appbase="$(basename "$app")"
+
+    [ -n "$name" ] ||
+        name="${appbase%.app}"
+
+    say \
+        "App: $app"
+
+    say \
+        "Name: $name"
+
+    say \
+        "Bundle ID: ${bid:-unknown}"
+
+    cask="$(
+        find_cask \
+            "$appbase" \
+            2>/dev/null ||
+        true
+    )"
+
+    if [ -n "$cask" ]; then
+        say \
+            "Homebrew owner: $cask"
+
+        say \
+            "Preferred: brew uninstall --cask --zap '$cask'"
+    fi
+
+    add_target "$app"
+
+    if [ -n "$bid" ]; then
+        for p in \
+            "$HOME/Library/Preferences/$bid.plist" \
+            "$HOME/Library/Caches/$bid" \
+            "$HOME/Library/Saved Application State/$bid.savedState" \
+            "$HOME/Library/HTTPStorages/$bid" \
+            "$HOME/Library/WebKit/$bid" \
+            "$HOME/Library/Containers/$bid"
+        do
+            add_target "$p"
+        done
+
+        for p in \
+            "$HOME/Library/Preferences/$bid".* \
+            "$HOME/Library/Caches/$bid".* \
+            "$HOME/Library/HTTPStorages/$bid".*
+        do
+            add_target "$p"
+        done
+    fi
+
+    add_target \
+        "$HOME/Library/Application Support/$name"
+
+    add_target \
+        "/Library/Application Support/$name"
+
+    target_launchd \
+        "$bid" \
+        "$appbase" \
+        "$name"
+
+    say ''
+    say \
+        'Candidates:'
+
+    for p in "${TARGET[@]}"
+    do
+        say \
+            "  $p"
+    done
+
+    say ''
+    say \
+        'Package receipts (report only):'
+
+    receipts=''
+
+    if [ -n "$bid" ]; then
+        receipts="$(
+            pkgutil \
+                --pkgs \
+                2>/dev/null |
+                grep \
+                    -Fi \
+                    "$bid" ||
+            true
+        )"
+    fi
+
+    [ -n "$receipts" ] ||
+        receipts="$(
+            pkgutil \
+                --pkgs \
+                2>/dev/null |
+                grep \
+                    -Fi \
+                    "${appbase%.app}" ||
+            true
+        )"
+
+    if [ -n "$receipts" ]; then
+        printf \
+            '%s\n' \
+            "$receipts" |
+            sed \
+                's/^/  /'
+    else
+        say \
+            '  none matched'
+    fi
+
+    if [ -n "$cask" ]; then
+        printf \
+            'Use Homebrew --zap now? [y/N] '
+
+        read -r answer
+
+        case "$answer" in
+            y|Y|yes|YES)
+                "$(brewbin)" \
+                    uninstall \
+                    --cask \
+                    --zap \
+                    "$cask"
+                return
+            ;;
+        esac
+    fi
+
+    printf \
+        "Move all candidates to $TRASH ? [y/N] "
+
+    read -r answer
+
+    case "$answer" in
+        y|Y|yes|YES)
+            for p in "${TARGET_PLISTS[@]}"
+            do
+                unload "$p"
+            done
+
+            for p in "${TARGET[@]}"
+            do
+                trash "$p"
+            done
+
+            say \
+                'BTM intentionally untouched.'
+        ;;
+    esac
+}
+
+# ============================================================
+# MAIN
+# ============================================================
+
+full()
+{
+    say \
+        "macuninstall $VER — evidence-based audit"
+
+    scan_apps
+    compare_snapshot
+    scan_launchd
+    scan_btm
+    scan_brew
+    report
+    save_snapshot
+    menu
+}
+
+case "${1:-}" in
+    '')
+        full
+    ;;
+    --audit)
+        full
+    ;;
+    --brew)
+        scan_brew
+        report
+        clean_brew
+    ;;
+    --snapshot)
+        scan_apps
+        save_snapshot
+        say \
+            "Snapshot saved: $SNAP"
+    ;;
+    -h|--help)
+        usage
+    ;;
+    --version)
+        say \
+            "$VER"
+    ;;
+    -*)
+        say \
+            "Unknown option: $1" \
+            >&2
+
+        usage
+        exit 2
+    ;;
+    *)
+        targeted "$1"
+    ;;
+esac
